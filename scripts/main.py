@@ -297,8 +297,7 @@ def on_ui_tabs():
     #rendered in the appropirate place with .render()
     boorulist = [booru["name"] for booru in settings["boorus"]]
     selectimage = gr.Image(label="Image", type="filepath", interactive=False)
-    searchimages = gr.Gallery(label="Search Results")
-    searchimages.style(grid=3)
+    searchimages = gr.Gallery(label="Search Results", columns=3)
     activeboorutext1 = gr.Textbox(label="Current Booru", value=settings['active'], interactive=False)
     activeboorutext2 = gr.Textbox(label="Current Booru", value=settings['active'], interactive=False)
     curpage = gr.Textbox(value="1", label="Page Number", interactive=False, show_label=True)
@@ -357,8 +356,8 @@ def on_ui_tabs():
                     with gr.Row(equal_height=True):
                         #Don't even ask me how this works. I spent like three days reading generation_parameters_copypaste.py
                         #and I still don't quite know. Automatic1111 must've been high when he wrote that.
-                        sendselected = modules.generation_parameters_copypaste.create_buttons(["txt2img", "img2img", "inpaint", "extras"])
-                        modules.generation_parameters_copypaste.bind_buttons(sendselected, selectimage, selectedtags)
+                        sendselected = modules.infotext_utils.create_buttons(["txt2img", "img2img", "inpaint", "extras"])
+                        modules.infotext_utils.bind_buttons(sendselected, selectimage, selectedtags)
         with gr.Tab("Search"):
             with gr.Row(equal_height=True):
                 with gr.Column():
