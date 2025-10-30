@@ -6,19 +6,22 @@
             "name": "Danbooru",
             "host": "https://danbooru.donmai.us",
             "username": "",
-            "apikey": ""
+            "apikey": "",
+            "system": "auto"
         },
         {
             "name": "Gelbooru",
             "host": "https://gelbooru.com",
             "username": "",
-            "apikey": ""
+            "apikey": "",
+            "system": "auto"
         },
         {
             "name": "AIBooru",
             "host": "https://aibooru.space",
             "username": "",
-            "apikey": ""
+            "apikey": "",
+            "system": "auto"
         }
     ]
 }

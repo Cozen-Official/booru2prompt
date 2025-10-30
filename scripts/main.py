@@ -1,7 +1,10 @@
 import json
 import os
+import re
+from functools import lru_cache
 from urllib.request import urlopen, urlretrieve, Request
 from urllib import parse
+from urllib.error import HTTPError, URLError
 import inspect
 
 import gradio as gr
@@ -14,6 +17,22 @@ from modules import script_callbacks, scripts
 #So this is my janky workaround to get this extensions directory.
 edirectory = inspect.getfile(lambda: None)
 edirectory = edirectory[:edirectory.find("scripts")]
+
+DEFAULT_HEADERS = {
+    "User-Agent": "booru2prompt/1.1 (+https://github.com/Malisius/booru2prompt)",
+}
+
+SYSTEM_DISPLAY_NAMES = {
+    "auto": "Auto (detect)",
+    "danbooru": "Danbooru",
+    "e621": "e621",
+    "moebooru": "Moebooru",
+    "gelbooru": "Gelbooru",
+    "philomena": "Philomena",
+}
+
+SUPPORTED_SYSTEMS = tuple(SYSTEM_DISPLAY_NAMES.keys())
+SYSTEM_NAME_LOOKUP = {v: k for k, v in SYSTEM_DISPLAY_NAMES.items()}
 
 def loadsettings():
     """Return a dictionary of settings read from settings.json in the extension directory
@@ -31,6 +50,9 @@ def loadsettings():
     for booru in settings["boorus"]:
         booru.setdefault("username", "")
         booru.setdefault("apikey", "")
+        booru.setdefault("system", "auto")
+        if booru["system"] not in SUPPORTED_SYSTEMS:
+            booru["system"] = "auto"
 
     if settings.get("boorus") and settings.get("active") not in [b["name"] for b in settings["boorus"]]:
         settings["active"] = settings["boorus"][0]["name"]
@@ -104,17 +126,525 @@ def _build_settings_outputs():
     if booru is None:
         raise gr.Error(f"Booru '{active_name}' was not found.")
 
+    system_value = booru.get("system", "auto")
+    system_display = SYSTEM_DISPLAY_NAMES.get(system_value, SYSTEM_DISPLAY_NAMES["auto"])
+
     return (
         gr.Dropdown.update(choices=booru_names, value=active_name),
         booru.get("name", ""),
         booru.get("host", ""),
         booru.get("username", ""),
         booru.get("apikey", ""),
+        system_display,
         active_name,
         active_name,
     )
 
-def savesettings(active, name, host, username, apikey, negprompt):
+def _sanitize_url_for_logging(url):
+    parsed = parse.urlparse(url)
+    query_items = parse.parse_qsl(parsed.query, keep_blank_values=True)
+    redacted = []
+    for key, value in query_items:
+        if key.lower() in {"login", "api_key", "password_hash", "user_id", "key"} and value:
+            redacted.append(f"{key}=***")
+        else:
+            redacted.append(f"{key}={value}")
+
+    sanitized = parsed._replace(query="&".join(redacted))
+    print(parse.urlunparse(sanitized))
+
+def _append_query(url, params):
+    if not params:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{parse.urlencode(params)}"
+
+def _fetch_json(url, *, raise_for_status=True):
+    request = Request(url, data=None, headers=DEFAULT_HEADERS)
+    try:
+        with urlopen(request) as response:
+            payload = response.read()
+    except (HTTPError, URLError) as error:
+        if raise_for_status:
+            raise
+        return None
+
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        if raise_for_status:
+            raise
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        if raise_for_status:
+            raise
+        return None
+
+def _safe_fetch_json(url, *, description):
+    try:
+        return _fetch_json(url)
+    except HTTPError as error:
+        raise gr.Error(f"Failed to {description}: HTTP {error.code}.") from error
+    except URLError as error:
+        raise gr.Error(f"Failed to {description}: {error.reason}.") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise gr.Error(f"Failed to {description}: Unexpected response from booru.") from error
+
+def _query_with_auth(params, username="", apikey="", *, auth_mode="danbooru"):
+    params = dict(params)
+    if auth_mode in ("danbooru", "e621"):
+        if username:
+            params["login"] = username
+        if apikey:
+            params["api_key"] = apikey
+    elif auth_mode == "moebooru":
+        if username:
+            params["login"] = username
+        if apikey:
+            params["password_hash"] = apikey
+    elif auth_mode == "gelbooru":
+        if username:
+            params["user_id"] = username
+        if apikey:
+            params["api_key"] = apikey
+    elif auth_mode == "philomena":
+        if apikey:
+            params["key"] = apikey
+    return params
+
+def _absolute_url(host, value):
+    if not value:
+        return ""
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    return host.rstrip("/") + ("/" if not value.startswith("/") else "") + value
+
+def _normalize_tags(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [tag for tag in value.split() if tag]
+
+    normalized = []
+    for item in value:
+        if not item:
+            continue
+        if isinstance(item, str):
+            normalized.append(item.replace(" ", "_").strip())
+        else:
+            normalized.append(str(item))
+    return [tag for tag in normalized if tag]
+
+def _prepare_local_image_path(index, source_url):
+    parsed = parse.urlparse(source_url)
+    _, ext = os.path.splitext(parsed.path)
+    if not ext or len(ext) > 6:
+        ext = ".jpg"
+    filename = f"temp{index}{ext}"
+    return os.path.join(edirectory, "tempimages", filename)
+
+def _build_tag_query(query, removeanimated):
+    query = (query or "").strip()
+    if removeanimated:
+        if query:
+            query += " "
+        query += "-animated"
+    return query.strip()
+
+def _extract_post_id(reference, host):
+    if not isinstance(reference, str):
+        return None, None
+
+    trimmed = reference.strip()
+    if not trimmed:
+        return None, None
+
+    if trimmed.startswith("id:"):
+        return trimmed[3:], None
+
+    if not trimmed.startswith("http"):
+        return trimmed, None
+
+    parsed = parse.urlparse(trimmed)
+    host_netloc = parse.urlparse(host).netloc
+    if parsed.netloc and host_netloc and parsed.netloc != host_netloc:
+        raise gr.Error("The provided URL does not match the selected booru.")
+
+    query = parse.parse_qs(parsed.query)
+    if "id" in query and query["id"]:
+        return query["id"][0], trimmed
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    for part in reversed(path_parts):
+        if re.fullmatch(r"\d+", part):
+            return part, trimmed
+
+    return None, trimmed
+
+def _normalize_post_general(post, *, image_url, artist=None, character=None, copyright=None, meta=None):
+    return {
+        "general": _normalize_tags(post),
+        "artist": _normalize_tags(artist or []),
+        "character": _normalize_tags(character or []),
+        "copyright": _normalize_tags(copyright or []),
+        "meta": _normalize_tags(meta or []),
+        "image_url": image_url,
+    }
+
+def _normalize_danbooru_post(post):
+    image_url = post.get("large_file_url") or post.get("file_url") or post.get("preview_file_url")
+    return _normalize_post_general(
+        post.get("tag_string_general"),
+        image_url=image_url,
+        artist=post.get("tag_string_artist"),
+        character=post.get("tag_string_character"),
+        copyright=post.get("tag_string_copyright"),
+        meta=post.get("tag_string_meta"),
+    )
+
+def _normalize_e621_post(post):
+    tags = post.get("tags", {})
+    general = []
+    for key in ("general", "species", "lore"):
+        general.extend(tags.get(key, []))
+    image_data = post.get("file", {})
+    image_url = image_data.get("url") or post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
+    return _normalize_post_general(
+        general,
+        image_url=image_url,
+        artist=tags.get("artist", []),
+        character=tags.get("character", []),
+        copyright=tags.get("copyright", []),
+        meta=tags.get("meta", []),
+    )
+
+def _normalize_moebooru_post(post):
+    image_url = post.get("file_url") or post.get("jpeg_url") or post.get("sample_url") or post.get("preview_url")
+    return _normalize_post_general(post.get("tags", ""), image_url=image_url)
+
+def _normalize_gelbooru_post(post):
+    image_url = post.get("file_url") or post.get("sample_url") or post.get("preview_url")
+    return _normalize_post_general(post.get("tags", ""), image_url=image_url)
+
+def _normalize_philomena_post(post):
+    tags = post.get("tags", [])
+    general = []
+    artist = []
+    character = []
+    for tag in tags:
+        lower = tag.lower()
+        if lower.startswith("artist:"):
+            artist.append(tag.split(":", 1)[1])
+        elif lower.startswith("character:") or lower.startswith("oc:"):
+            character.append(tag.split(":", 1)[1])
+        else:
+            general.append(tag)
+
+    image_url = post.get("representations", {}).get("full") or post.get("view_url")
+    return _normalize_post_general(general, image_url=image_url, artist=artist, character=character)
+
+@lru_cache(maxsize=None)
+def detect_booru_type(host, username="", apikey=""):
+    host = (host or "").rstrip("/")
+    username = username or ""
+    apikey = apikey or ""
+
+    detectors = [
+        lambda: _detect_danbooru(host, username, apikey),
+        lambda: _detect_moebooru(host, username, apikey),
+        lambda: _detect_gelbooru(host, username, apikey),
+        lambda: _detect_philomena(host, username, apikey),
+    ]
+
+    for detector in detectors:
+        booru_type = detector()
+        if booru_type:
+            return booru_type
+
+    raise gr.Error("Unable to determine the booru type. Please verify the host URL and credentials.")
+
+def _detect_danbooru(host, username, apikey):
+    params = _query_with_auth({"limit": 1}, username, apikey, auth_mode="danbooru")
+    url = f"{host}/posts.json?{parse.urlencode(params)}"
+    data = _fetch_json(url, raise_for_status=False)
+    if not data:
+        return None
+
+    if isinstance(data, dict) and "posts" in data:
+        return "e621"
+
+    if isinstance(data, list) and data and isinstance(data[0], dict) and "tag_string_general" in data[0]:
+        return "danbooru"
+
+    return None
+
+def _detect_moebooru(host, username, apikey):
+    params = _query_with_auth({"limit": 1}, username, apikey, auth_mode="moebooru")
+    url = f"{host}/post.json?{parse.urlencode(params)}"
+    data = _fetch_json(url, raise_for_status=False)
+    if isinstance(data, list) and data and isinstance(data[0], dict) and "tags" in data[0]:
+        return "moebooru"
+    return None
+
+def _detect_gelbooru(host, username, apikey):
+    params = _query_with_auth(
+        {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "json": 1,
+            "limit": 1,
+        },
+        username,
+        apikey,
+        auth_mode="gelbooru",
+    )
+    url = f"{host}/index.php?{parse.urlencode(params)}"
+    data = _fetch_json(url, raise_for_status=False)
+    if isinstance(data, dict) and "post" in data:
+        posts = data["post"]
+        if isinstance(posts, dict) or (isinstance(posts, list) and posts):
+            return "gelbooru"
+    if isinstance(data, list) and data:
+        return "gelbooru"
+    return None
+
+def _detect_philomena(host, username, apikey):
+    params = _query_with_auth({"q": "id.gt:0", "per_page": 1, "page": 1}, username, apikey, auth_mode="philomena")
+    url = f"{host}/api/v1/json/search/images?{parse.urlencode(params)}"
+    data = _fetch_json(url, raise_for_status=False)
+    if isinstance(data, dict) and data.get("images") is not None:
+        return "philomena"
+    return None
+
+def _search_danbooru(host, username, apikey, tags, page, limit):
+    params = _query_with_auth({"limit": limit, "page": page}, username, apikey, auth_mode="danbooru")
+    params["tags"] = tags
+    url = f"{host}/posts.json?{parse.urlencode(params)}"
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="search the booru")
+    posts = data.get("posts", []) if isinstance(data, dict) else data
+    if posts is None:
+        posts = []
+    if not isinstance(posts, list):
+        raise gr.Error("Booru returned an unexpected search payload.")
+
+    results = []
+    for post in posts:
+        if not isinstance(post, dict) or post.get("id") is None:
+            continue
+        normalized = _normalize_danbooru_post(post)
+        image_url = normalized.get("image_url")
+        if not image_url:
+            continue
+        results.append({"id": str(post["id"]), "image_url": image_url})
+    return results
+
+def _search_e621(host, username, apikey, tags, page, limit):
+    params = _query_with_auth({"limit": limit, "page": page}, username, apikey, auth_mode="e621")
+    params["tags"] = tags
+    url = f"{host}/posts.json?{parse.urlencode(params)}"
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="search the booru")
+    posts = data.get("posts", []) if isinstance(data, dict) else []
+    if not isinstance(posts, list):
+        raise gr.Error("Booru returned an unexpected search payload.")
+
+    results = []
+    for post in posts:
+        if not isinstance(post, dict) or post.get("id") is None:
+            continue
+        normalized = _normalize_e621_post(post)
+        image_url = normalized.get("image_url")
+        if not image_url:
+            continue
+        results.append({"id": str(post["id"]), "image_url": image_url})
+    return results
+
+def _search_moebooru(host, username, apikey, tags, page, limit):
+    params = _query_with_auth({"limit": limit, "page": page, "tags": tags}, username, apikey, auth_mode="moebooru")
+    url = f"{host}/post.json?{parse.urlencode(params)}"
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="search the booru")
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise gr.Error("Booru returned an unexpected search payload.")
+
+    results = []
+    for post in data:
+        if not isinstance(post, dict) or post.get("id") is None:
+            continue
+        normalized = _normalize_moebooru_post(post)
+        image_url = normalized.get("image_url")
+        if not image_url:
+            continue
+        results.append({"id": str(post["id"]), "image_url": image_url})
+    return results
+
+def _search_gelbooru(host, username, apikey, tags, page, limit):
+    pid = max(page - 1, 0)
+    params = _query_with_auth(
+        {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "json": 1,
+            "limit": limit,
+            "tags": tags,
+            "pid": pid,
+        },
+        username,
+        apikey,
+        auth_mode="gelbooru",
+    )
+    url = f"{host}/index.php?{parse.urlencode(params)}"
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="search the booru")
+    if isinstance(data, dict):
+        posts = data.get("post", [])
+        if isinstance(posts, dict):
+            posts = [posts]
+    else:
+        posts = data
+    if posts is None:
+        posts = []
+    if not isinstance(posts, list):
+        raise gr.Error("Booru returned an unexpected search payload.")
+
+    results = []
+    for post in posts:
+        if not isinstance(post, dict) or post.get("id") is None:
+            continue
+        normalized = _normalize_gelbooru_post(post)
+        image_url = normalized.get("image_url")
+        if not image_url:
+            continue
+        results.append({"id": str(post["id"]), "image_url": image_url})
+    return results
+
+def _search_philomena(host, username, apikey, tags, page, limit):
+    tokens = [token for token in (tags or "").split() if token]
+    query_value = ",".join(tokens) if tokens else "*"
+    params = _query_with_auth({"q": query_value, "per_page": limit, "page": page}, username, apikey, auth_mode="philomena")
+    url = f"{host}/api/v1/json/search/images?{parse.urlencode(params)}"
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="search the booru")
+    images = data.get("images", []) if isinstance(data, dict) else []
+    if not isinstance(images, list):
+        raise gr.Error("Booru returned an unexpected search payload.")
+
+    results = []
+    for image in images:
+        if not isinstance(image, dict) or image.get("id") is None:
+            continue
+        normalized = _normalize_philomena_post(image)
+        image_url = normalized.get("image_url")
+        if not image_url:
+            continue
+        results.append({"id": str(image["id"]), "image_url": image_url})
+    return results
+
+SEARCH_HANDLERS = {
+    "danbooru": _search_danbooru,
+    "e621": _search_e621,
+    "moebooru": _search_moebooru,
+    "gelbooru": _search_gelbooru,
+    "philomena": _search_philomena,
+}
+
+def _fetch_danbooru_post(host, username, apikey, post_id, reference_url):
+    params = _query_with_auth({}, username, apikey, auth_mode="danbooru")
+    if post_id:
+        url = _append_query(f"{host}/posts/{post_id}.json", params)
+    elif reference_url:
+        cleaned = reference_url.split("?")[0]
+        if not cleaned.endswith(".json"):
+            cleaned += ".json"
+        url = _append_query(cleaned, params)
+    else:
+        raise gr.Error("Unable to determine which post to load.")
+
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="load post details")
+    if isinstance(data, dict):
+        return _normalize_danbooru_post(data)
+    raise gr.Error("Booru returned an unexpected payload when loading the post.")
+
+def _fetch_e621_post(host, username, apikey, post_id, reference_url):
+    if not post_id:
+        raise gr.Error("Unable to determine which post to load.")
+    params = _query_with_auth({}, username, apikey, auth_mode="e621")
+    url = _append_query(f"{host}/posts/{post_id}.json", params)
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="load post details")
+    if isinstance(data, dict) and isinstance(data.get("post"), dict):
+        return _normalize_e621_post(data["post"])
+    raise gr.Error("Booru returned an unexpected payload when loading the post.")
+
+def _fetch_moebooru_post(host, username, apikey, post_id, reference_url):
+    if not post_id:
+        raise gr.Error("Unable to determine which post to load.")
+    params = _query_with_auth({"tags": f"id:{post_id}", "limit": 1}, username, apikey, auth_mode="moebooru")
+    url = f"{host}/post.json?{parse.urlencode(params)}"
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="load post details")
+    if isinstance(data, list) and data:
+        return _normalize_moebooru_post(data[0])
+    raise gr.Error("Post could not be found on the selected booru.")
+
+def _fetch_gelbooru_post(host, username, apikey, post_id, reference_url):
+    if not post_id:
+        raise gr.Error("Unable to determine which post to load.")
+    params = _query_with_auth(
+        {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "json": 1,
+            "id": post_id,
+            "limit": 1,
+        },
+        username,
+        apikey,
+        auth_mode="gelbooru",
+    )
+    url = f"{host}/index.php?{parse.urlencode(params)}"
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="load post details")
+    if isinstance(data, dict) and data.get("post"):
+        posts = data["post"]
+        if isinstance(posts, dict):
+            return _normalize_gelbooru_post(posts)
+        if isinstance(posts, list) and posts:
+            return _normalize_gelbooru_post(posts[0])
+    if isinstance(data, list) and data:
+        return _normalize_gelbooru_post(data[0])
+    raise gr.Error("Post could not be found on the selected booru.")
+
+def _fetch_philomena_post(host, username, apikey, post_id, reference_url):
+    if not post_id:
+        raise gr.Error("Unable to determine which post to load.")
+    params = _query_with_auth({}, username, apikey, auth_mode="philomena")
+    url = _append_query(f"{host}/api/v1/json/images/{post_id}", params)
+    _sanitize_url_for_logging(url)
+    data = _safe_fetch_json(url, description="load post details")
+    if isinstance(data, dict) and isinstance(data.get("image"), dict):
+        return _normalize_philomena_post(data["image"])
+    raise gr.Error("Post could not be found on the selected booru.")
+
+POST_FETCHERS = {
+    "danbooru": _fetch_danbooru_post,
+    "e621": _fetch_e621_post,
+    "moebooru": _fetch_moebooru_post,
+    "gelbooru": _fetch_gelbooru_post,
+    "philomena": _fetch_philomena_post,
+}
+
+def savesettings(active, name, host, username, apikey, system_display, negprompt):
     """Persist updates to the currently selected booru.
 
     Args:
@@ -123,14 +653,19 @@ def savesettings(active, name, host, username, apikey, negprompt):
         host (str): The base URL for the booru
         username (str): The username for that booru
         apikey (str): The user's api key
+        system_display (str): The booru system to use for requests
         negprompt (str): The negative prompt to be appended to each image selection
-    """    
+    """
     original_name = active
     name = (name or "").strip()
     if not name:
         raise gr.Error("Booru name cannot be empty.")
 
     host = _normalize_host(host)
+
+    system_value = SYSTEM_NAME_LOOKUP.get(system_display, system_display)
+    if system_value not in SUPPORTED_SYSTEMS:
+        raise gr.Error("Unsupported booru system selected.")
 
     booru_index = _find_booru_index(original_name)
     if booru_index is None:
@@ -144,6 +679,7 @@ def savesettings(active, name, host, username, apikey, negprompt):
     booru["host"] = host
     booru["username"] = username or ""
     booru["apikey"] = apikey or ""
+    booru["system"] = system_value
 
     settings["active"] = name
     settings["negativeprompt"] = negprompt
@@ -152,12 +688,16 @@ def savesettings(active, name, host, username, apikey, negprompt):
 
     return _build_settings_outputs()
 
-def addbooru(name, host, username, apikey, negprompt):
+def addbooru(name, host, username, apikey, system_display, negprompt):
     name = (name or "").strip()
     if not name:
         raise gr.Error("Booru name cannot be empty.")
 
     host = _normalize_host(host)
+
+    system_value = SYSTEM_NAME_LOOKUP.get(system_display, system_display)
+    if system_value not in SUPPORTED_SYSTEMS:
+        raise gr.Error("Unsupported booru system selected.")
 
     if name in _booru_names():
         raise gr.Error(f"A booru named '{name}' already exists.")
@@ -167,6 +707,7 @@ def addbooru(name, host, username, apikey, negprompt):
         "host": host,
         "username": username or "",
         "apikey": apikey or "",
+        "system": system_value,
     })
 
     settings["active"] = name
@@ -205,11 +746,10 @@ def getauth():
 
     Returns:
         tuple: (username, apikey) for whichever booru is selected in the dropdown
-    """    
-    active_name = _ensure_active()
-    for b in settings['boorus']:
-        if b['name'] == active_name:
-            return b.get('username', ''), b.get('apikey', '')
+    """
+    booru = _get_active_booru()
+    if booru:
+        return booru.get('username', ''), booru.get('apikey', '')
     return "", ""
 
 def gethost():
@@ -222,11 +762,17 @@ def gethost():
     Returns:
         str: The full url for the selected booru
     """    
-    active_name = _ensure_active()
-    for booru in settings['boorus']:
-        if booru['name'] == active_name:
-            return booru.get('host', '')
+    booru = _get_active_booru()
+    if booru:
+        return booru.get('host', '')
     return ""
+
+def _get_active_booru():
+    active_name = _ensure_active()
+    for booru in settings.get('boorus', []):
+        if booru.get('name') == active_name:
+            return booru
+    return None
 
 def searchbooru(query, removeanimated, curpage, pagechange=0):
     """Search the currently selected booru, and return a list of images and the current page.
@@ -242,83 +788,59 @@ def searchbooru(query, removeanimated, curpage, pagechange=0):
         a str filepath to a locally saved image, and [1] is a string representation
         of the id for that image on the searched booru.
         The string in this return is new current page number, which may or may not have been changed.
-    """    
+    """
     host = gethost()
     u, a = getauth()
+    booru = _get_active_booru() or {}
+    system_override = (booru.get("system", "auto") or "auto").lower()
+    if system_override not in SUPPORTED_SYSTEMS:
+        system_override = "auto"
+    if system_override == "auto":
+        booru_type = detect_booru_type(host, u, a)
+    else:
+        booru_type = system_override
 
     #If the page isn't changing, then the user almost certainly is initiating a new
     #search, so we can set the page number back to 1.
     if pagechange == 0:
         curpage = 1
-    else:    
-        curpage = int(curpage) + pagechange
+    else:
+        try:
+            curpage = int(curpage)
+        except (TypeError, ValueError):
+            curpage = 1
+        curpage = curpage + pagechange
         if curpage < 1:
             curpage = 1
 
     #We're about to use this in a url, so make it a string real quick
     curpage = str(curpage)
 
-    url = host + f"/posts.json?"
+    handler = SEARCH_HANDLERS.get(booru_type)
+    if handler is None:
+        raise gr.Error(f"Search is not supported for booru type '{booru_type}'.")
 
-    #Only append login parameters if we actually got some from the above getauth()
-    #In the default settings.json in the repo, these are empty strings, so they'll
-    #return false here.
-    if u:
-        url += f"login={u}&"
-    if a:
-        url += f"api_key={a}&"
+    tags = _build_tag_query(query, removeanimated)
+    results = handler(host, u, a, tags, int(curpage), 6)
 
-    #Prepare the append some search tags
-    #We can leave this here even if param:query is empty, since the api call still works apparently
-    url += "tags="
-
-    #Add in the -animated tag if that checkbox was selected
-    #I have no idea what happens if "animated" is searched for and that box is checked,
-    #and I'm not testing that myself
-    if removeanimated:
-        url += "-animated+"
-
-    #TODO: Add a settings option to change the images-per-page here
-    url += f"{parse.quote_plus(query)}&limit=6"
-    url += f"&page={curpage}"
-
-    #I had this print here just to test my url building, but I kind of like it, so I'm leaving it
-    print(url)
-
-    #Normally it's fine to call urlopen() with just a string url, but some boorus get finicky about
-    #setting a user-agent, so this builds a request with custom headers
-    request = Request(url, data=None, headers = {'User-Agent': 'booru2prompt, a Stable Diffusion project (made by Borderless)'})
-    response = urlopen(request)
-    data = json.loads(response.read())
+    temp_dir = os.path.join(edirectory, "tempimages")
+    os.makedirs(temp_dir, exist_ok=True)
 
     localimages = []
+    for index, item in enumerate(results):
+        image_url = _absolute_url(host, item.get("image_url"))
+        if not image_url:
+            continue
 
-    #Creating the required directory for temporary images could be done in a preload.py, but I prefer to do this
-    #check each time we go to save images, just in case
-    if not os.path.exists(edirectory + "tempimages"):
-        os.makedirs(edirectory + "tempimages")
+        savepath = _prepare_local_image_path(index, image_url)
+        try:
+            urlretrieve(image_url, savepath)
+        except Exception as error:
+            print(f"Failed to cache preview {image_url}: {error}")
+            continue
 
-    #The length of the returned json array might not actually be equal to what we reqeusted with limit=,
-    #so we need to make sure to only step through what we got back
-    for i in range(len(data)):
-        #So I guess not every returned result has a 'file_url'. Could not tell you why that is.
-        #Doesn't matter. If there's no file to grab, just skip the entry.
-        if 'file_url' in data[i]:
-            imageurl = data[i]['file_url']
-            #The format of this string is important. When we later go to query for specific posts, the user can use
-            #"id:xxxxxx" instead of a full url to make that request
-            id = "id:" + str(data[i]['id'])
-            #I forget why I added this
-            if "http" not in imageurl:
-                imageurl = gethost() + imageurl
-            #We're storing the images locally to be crammed into a Gradio gallery later.
-            #This seemed simpler than using PIL images or whatever.
-            savepath = edirectory + f"tempimages\\temp{i}.jpg"
-            image = urlretrieve(imageurl, savepath)
-            localimages.append((savepath, id))
+        localimages.append((savepath, f"id:{item['id']}"))
 
-    #We're returning not just the images for the gallery, but the current page number
-    #So that textbox in Gradio can be updated
     return localimages, curpage
 
 def gotonextpage(query, removeanimated, curpage):
@@ -343,7 +865,10 @@ def updatesettings(active = settings['active']):
     booru = next((b for b in settings['boorus'] if b['name'] == active_name), None)
 
     if not booru:
-        return "", "", active_name, active_name, "", ""
+        system_display = SYSTEM_DISPLAY_NAMES["auto"]
+        return "", "", active_name, active_name, "", "", system_display
+
+    system_display = SYSTEM_DISPLAY_NAMES.get(booru.get('system', 'auto'), SYSTEM_DISPLAY_NAMES['auto'])
 
     return (
         booru.get('username', ''),
@@ -352,6 +877,7 @@ def updatesettings(active = settings['active']):
         active_name,
         booru.get('name', ''),
         booru.get('host', ''),
+        system_display,
     )
 
 def grabtags(url, negprompt, replacespaces, replaceunderscores, includeartist, includecharacter, includecopyright, includemeta):
@@ -372,84 +898,65 @@ def grabtags(url, negprompt, replacespaces, replaceunderscores, includeartist, i
         In order, it's the final tag string, the local path to the saved image, the artist tags, the
         character tags, the copyright tags, and the meta tags.
     """
-    #This check may be uneccesary, but we should fail out immediately if the url isn't a string.
-    #I struggle to remember what circumstance compelled me to add this.
     if not isinstance(url, str):
         return
 
-    #Quick check to see if the user is selecting with the "id:xxxxxx" format.
-    #If the are, we can all the extra stuff for them
-    if url[0:2] == "id":
-        url = gethost() + "/posts/" + url[3:]
+    host = gethost()
+    username, apikey = getauth()
+    booru = _get_active_booru() or {}
+    system_override = (booru.get("system", "auto") or "auto").lower()
+    if system_override not in SUPPORTED_SYSTEMS:
+        system_override = "auto"
+    if system_override == "auto":
+        booru_type = detect_booru_type(host, username, apikey)
+    else:
+        booru_type = system_override
 
-    #Many times, copying a link right off the booru will result in a lot of extra
-    #url parameters. We need to get rid of all those before we add our own.
-    index = url.find("?")
-    if index > -1:
-        url = url[:index]
+    post_id, reference_url = _extract_post_id(url, host)
+    fetcher = POST_FETCHERS.get(booru_type)
+    if fetcher is None:
+        raise gr.Error(f"Loading posts is not supported for booru type '{booru_type}'.")
 
-    #Check to make sure the request isn't already a .json api call before we add it ourselves
-    if not url[-4:] == "json":
-        url = url + ".json"
+    normalized = fetcher(host, username, apikey, post_id, reference_url)
 
-    #Add the question mark denoting url parameters back in
-    url += "?"
+    image_url = _absolute_url(host, normalized.get("image_url"))
+    if not image_url:
+        raise gr.Error("The selected post did not include an image URL.")
 
-    u, a = getauth()
+    artisttags = " ".join(normalized.get("artist", []))
+    charactertags = " ".join(normalized.get("character", []))
+    copyrighttags = " ".join(normalized.get("copyright", []))
+    metatags = " ".join(normalized.get("meta", []))
+    generaltags = " ".join(normalized.get("general", []))
 
-    #Only append login parameters if we actually got some from the above getauth()
-    #In the default settings.json in the repo, these are empty strings, so they'll
-    #return false here.
-    if u:
-        url += f"login={u}&"
-    if a:
-        url += f"api_key={a}&"
-
-    print(url)
-
-    response = urlopen(url)
-    data = json.loads(response.read())
-
-    tags = data['tag_string_general']
-    imageurl = data['file_url']
-
-    if "http" not in imageurl:
-        imageurl = gethost() + imageurl
-
-    artisttags = data["tag_string_artist"]
-    charactertags = data["tag_string_character"]
-    copyrighttags = data["tag_string_copyright"]
-    metatags = data["tag_string_meta"]
-
-    #We got all these extra tags, but we're only including them in the final string if the relevant 
-    #checkboxes have been checked
+    tag_sections = []
     if includeartist and artisttags:
-        tags = artisttags + " " + tags
+        tag_sections.append(artisttags)
     if includecharacter and charactertags:
-        tags = charactertags + " " + tags
+        tag_sections.append(charactertags)
     if includecopyright and copyrighttags:
-        tags = copyrighttags + " " + tags
+        tag_sections.append(copyrighttags)
     if includemeta and metatags:
-        tags = metatags + " " + tags
+        tag_sections.append(metatags)
+    if generaltags:
+        tag_sections.append(generaltags)
 
-    #It would be a shame if someone got these backwards and couldn't figure out the issue for a whole day
+    tags = " ".join(section for section in tag_sections if section)
+
     if replacespaces:
         tags = tags.replace(" ", ", ")
     if replaceunderscores:
         tags = tags.replace("_", " ")
 
-    #Adding a line for the negative prompt if we receieved one
-    #It's formatted this way very specifically. This is how the metadata looks on pngs coming out of SD
     if negprompt:
         tags += f"\nNegative prompt: {negprompt}"
 
-    #Creating the temp directory if it doesn't already exist
-    if not os.path.exists(edirectory + "tempimages"):
-        os.makedirs(edirectory + "tempimages")
-    urlretrieve(imageurl, edirectory +  "tempimages\\temp.jpg")
+    temp_dir = os.path.join(edirectory, "tempimages")
+    os.makedirs(temp_dir, exist_ok=True)
+    savepath = os.path.join(temp_dir, "temp.jpg")
+    urlretrieve(image_url, savepath)
 
-    #My god look at that tuple
-    return (tags, edirectory + "tempimages\\temp.jpg", artisttags, charactertags, copyrighttags, metatags)
+    return (tags, savepath, artisttags, charactertags, copyrighttags, metatags)
 
 def on_ui_tabs():
     #Just setting up some gradio components way early
@@ -460,6 +967,7 @@ def on_ui_tabs():
     _ensure_active()
     boorulist = _booru_names()
     active_booru = next((b for b in settings["boorus"] if b["name"] == settings["active"]), {})
+    active_system_display = SYSTEM_DISPLAY_NAMES.get(active_booru.get("system", "auto"), SYSTEM_DISPLAY_NAMES["auto"])
     selectimage = gr.Image(label="Image", type="filepath", interactive=False)
     searchimages = gr.Gallery(label="Search Results", columns=3)
     activeboorutext1 = gr.Textbox(label="Current Booru", value=settings['active'], interactive=False)
@@ -555,15 +1063,16 @@ def on_ui_tabs():
             u, a = getauth()
             username = gr.Textbox(label="Username", value=u)
             apikey = gr.Textbox(label="API Key", value=a)
+            boorutype = gr.Dropdown(label="Booru System", choices=list(SYSTEM_DISPLAY_NAMES.values()), value=active_system_display)
             negprompt.render()
             with gr.Row():
                 addboorubutton = gr.Button(value="Add as New Booru", variant="secondary")
                 savesettingsbutton = gr.Button(value="Save Booru", variant="primary")
                 removeboorubutton = gr.Button(value="Remove Booru", variant="secondary")
-            savesettingsbutton.click(fn=savesettings, inputs=[booru, booruname, booruhost, username, apikey, negprompt], outputs=[booru, booruname, booruhost, username, apikey, activeboorutext1, activeboorutext2])
-            addboorubutton.click(fn=addbooru, inputs=[booruname, booruhost, username, apikey, negprompt], outputs=[booru, booruname, booruhost, username, apikey, activeboorutext1, activeboorutext2])
-            removeboorubutton.click(fn=removebooru, inputs=[booru, negprompt], outputs=[booru, booruname, booruhost, username, apikey, activeboorutext1, activeboorutext2])
-            booru.change(fn=updatesettings, inputs=booru, outputs=[username, apikey, activeboorutext1, activeboorutext2, booruname, booruhost])
+            savesettingsbutton.click(fn=savesettings, inputs=[booru, booruname, booruhost, username, apikey, boorutype, negprompt], outputs=[booru, booruname, booruhost, username, apikey, boorutype, activeboorutext1, activeboorutext2])
+            addboorubutton.click(fn=addbooru, inputs=[booruname, booruhost, username, apikey, boorutype, negprompt], outputs=[booru, booruname, booruhost, username, apikey, boorutype, activeboorutext1, activeboorutext2])
+            removeboorubutton.click(fn=removebooru, inputs=[booru, negprompt], outputs=[booru, booruname, booruhost, username, apikey, boorutype, activeboorutext1, activeboorutext2])
+            booru.change(fn=updatesettings, inputs=booru, outputs=[username, apikey, activeboorutext1, activeboorutext2, booruname, booruhost, boorutype])
 
     return (interface, "booru2prompt", "b2p_interface"),
 
