@@ -146,11 +146,11 @@ def _sanitize_url_for_logging(url):
     redacted = []
     for key, value in query_items:
         if key.lower() in {"login", "api_key", "password_hash", "user_id", "key"} and value:
-            redacted.append(f"{key}=***")
+            redacted.append((key, "***"))
         else:
-            redacted.append(f"{key}={value}")
+            redacted.append((key, value))
 
-    sanitized = parsed._replace(query="&".join(redacted))
+    sanitized = parsed._replace(query=parse.urlencode(redacted))
     print(parse.urlunparse(sanitized))
 
 def _append_query(url, params):
@@ -187,11 +187,15 @@ def _safe_fetch_json(url, *, description):
     try:
         return _fetch_json(url)
     except HTTPError as error:
-        raise gr.Error(f"Failed to {description}: HTTP {error.code}.") from error
+        raise gr.Error(f"Failed to {description}: HTTP {error.code}. The booru may require authentication or the endpoint may not exist.") from error
     except URLError as error:
         raise gr.Error(f"Failed to {description}: {error.reason}.") from error
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise gr.Error(f"Failed to {description}: Unexpected response from booru.") from error
+        raise gr.Error(
+            f"Failed to {description}: The booru returned a non-JSON response. "
+            "This may indicate an authentication error, an incorrect booru system type, or that the API is unavailable. "
+            "Try verifying your credentials or manually selecting the correct booru system type in Settings."
+        ) from error
 
 def _query_with_auth(params, username="", apikey="", *, auth_mode="danbooru"):
     params = dict(params)
@@ -353,18 +357,22 @@ def detect_booru_type(host, username="", apikey=""):
     apikey = apikey or ""
 
     detectors = [
-        lambda: _detect_danbooru(host, username, apikey),
-        lambda: _detect_moebooru(host, username, apikey),
-        lambda: _detect_gelbooru(host, username, apikey),
-        lambda: _detect_philomena(host, username, apikey),
+        ("Danbooru/e621", lambda: _detect_danbooru(host, username, apikey)),
+        ("Moebooru", lambda: _detect_moebooru(host, username, apikey)),
+        ("Gelbooru", lambda: _detect_gelbooru(host, username, apikey)),
+        ("Philomena", lambda: _detect_philomena(host, username, apikey)),
     ]
 
-    for detector in detectors:
+    for name, detector in detectors:
         booru_type = detector()
         if booru_type:
+            print(f"Detected booru type: {booru_type} (matched {name} pattern)")
             return booru_type
 
-    raise gr.Error("Unable to determine the booru type. Please verify the host URL and credentials.")
+    raise gr.Error(
+        "Unable to determine the booru type. The API did not match any known booru systems. "
+        "Please verify the host URL and credentials, or manually select the booru system type in Settings."
+    )
 
 def _detect_danbooru(host, username, apikey):
     params = _query_with_auth({"limit": 1}, username, apikey, auth_mode="danbooru")
