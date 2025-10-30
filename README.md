@@ -8,12 +8,17 @@ This SD extension allows you to turn posts from various image boorus into stable
 
 To install this extension, navigate to your `extensions` directory and run `git clone https://github.com/Malisius/booru2prompt.git`. You can either restart SD completely or look at the bottom of SD's settings for `Restart Gradio and Refresh Components`. 
 
-To start, visit the `API Keys` tab to put in your API keys. Most features should work without this, but some things like sort tags might not work depending on the restrictions of the booru.
-The included `settings.json` has configuration for danbooru.donmai.us and aibooru.space, but you can add your own by following the same format. Just add a new entry to the `boorus` list with the `name` and `host` keys.
+To start, visit the `Settings/API Keys` tab to put in your API keys. Most features should work without this, but some things like sort tags might not work depending on the restrictions of the booru.
 
-`{"name": "Danbooru", "host": "https://danbooru.donmai.us", "username": "", "apikey": ""}`
+The extension now ships with three pre-configured services—Danbooru, Gelbooru, and AIBooru—so you can get going immediately. When you want to connect to a different booru, use the UI controls on that same tab:
 
-Take note: calls to aibooru.space are returning `403: Forbidden` no matter what I try. Any help with that would be appreciated.  
+1. Pick an existing entry from the **Booru** dropdown to review or edit its credentials.
+2. Adjust the display name, host URL, and optional username or API key fields. Host URLs must be valid `http://` or `https://` addresses; the extension normalises the URL and persists it back to `settings.json` for you.
+3. Press **Save Booru** to update the selected entry, **Add as New Booru** to clone the form into a brand-new slot, or **Remove Booru** if you no longer need the selection.
+
+Any updates you make are written straight to `settings.json`, so the dropdown refreshes immediately and your choices are available the next time you launch the extension. Credentials remain optional—leave them blank unless the target booru requires authentication for the features you need.
+
+Looking for more communities to connect? The [list of boorus curated by red-tails](https://github.com/red-tails/list-of-boorus) is a great starting point for finding popular alternatives and niche hosts alike.
   
 ![image](https://user-images.githubusercontent.com/6227122/202934555-5eb73c22-aa8c-4757-b122-c47e6b7e7964.png)
 
