@@ -100,7 +100,9 @@ def _build_settings_outputs():
             "",
         )
 
-    booru = next(b for b in settings["boorus"] if b["name"] == active_name)
+    booru = next((b for b in settings["boorus"] if b["name"] == active_name), None)
+    if booru is None:
+        raise gr.Error(f"Booru '{active_name}' was not found.")
 
     return (
         gr.Dropdown.update(choices=booru_names, value=active_name),
