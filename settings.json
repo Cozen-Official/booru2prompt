@@ -9,6 +9,12 @@
             "apikey": ""
         },
         {
+            "name": "Gelbooru",
+            "host": "https://gelbooru.com",
+            "username": "",
+            "apikey": ""
+        },
+        {
             "name": "AIBooru",
             "host": "https://aibooru.space",
             "username": "",

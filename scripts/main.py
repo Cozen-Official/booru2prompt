@@ -22,31 +22,180 @@ def loadsettings():
         dict: settings and api keys
     """    
     print("Loading booru2prompt settings")
-    file = open(edirectory + "settings.json")
-    settings = json.load(file)
-    file.close()
+    with open(edirectory + "settings.json", encoding="utf-8") as file:
+        settings = json.load(file)
+
+    if "boorus" not in settings:
+        settings["boorus"] = []
+
+    for booru in settings["boorus"]:
+        booru.setdefault("username", "")
+        booru.setdefault("apikey", "")
+
+    if settings.get("boorus") and settings.get("active") not in [b["name"] for b in settings["boorus"]]:
+        settings["active"] = settings["boorus"][0]["name"]
+
     return settings
 
-def savesettings(active, username, apikey, negprompt):
-    """Save the current username and api key to the active booru
+def _booru_names():
+    return [booru["name"] for booru in settings["boorus"]]
+
+def _find_booru_index(name):
+    for index, booru in enumerate(settings["boorus"]):
+        if booru["name"] == name:
+            return index
+    return None
+
+def _ensure_active(preferred=None):
+    booru_names = _booru_names()
+    if not booru_names:
+        settings["active"] = ""
+        return ""
+
+    if preferred and preferred in booru_names:
+        settings["active"] = preferred
+    elif settings.get("active") not in booru_names:
+        settings["active"] = booru_names[0]
+
+    return settings["active"]
+
+def _normalize_host(host):
+    host = (host or "").strip()
+    if not host:
+        raise gr.Error("Host URL cannot be empty.")
+
+    parsed = parse.urlparse(host)
+    if not parsed.scheme:
+        host = "https://" + host
+        parsed = parse.urlparse(host)
+
+    if parsed.scheme not in ("http", "https"):
+        raise gr.Error("Host URL must start with http:// or https://.")
+    if not parsed.netloc:
+        raise gr.Error("Host URL must include a domain.")
+
+    normalized_path = parsed.path.rstrip("/")
+    normalized_host = f"{parsed.scheme}://{parsed.netloc}"
+    if normalized_path:
+        normalized_host += normalized_path
+
+    return normalized_host
+
+def _persist_settings():
+    with open(edirectory + "settings.json", "w", encoding="utf-8") as file:
+        json.dump(settings, file, indent=4)
+
+def _build_settings_outputs():
+    active_name = _ensure_active()
+    booru_names = _booru_names()
+
+    if not booru_names:
+        return (
+            gr.Dropdown.update(choices=[], value=None),
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        )
+
+    booru = next((b for b in settings["boorus"] if b["name"] == active_name), None)
+    if booru is None:
+        raise gr.Error(f"Booru '{active_name}' was not found.")
+
+    return (
+        gr.Dropdown.update(choices=booru_names, value=active_name),
+        booru.get("name", ""),
+        booru.get("host", ""),
+        booru.get("username", ""),
+        booru.get("apikey", ""),
+        active_name,
+        active_name,
+    )
+
+def savesettings(active, name, host, username, apikey, negprompt):
+    """Persist updates to the currently selected booru.
 
     Args:
         active (str): The string identifier of the currently selected booru
+        name (str): The updated display name for the booru
+        host (str): The base URL for the booru
         username (str): The username for that booru
         apikey (str): The user's api key
         negprompt (str): The negative prompt to be appended to each image selection
     """    
-    settings["active"] = active
+    original_name = active
+    name = (name or "").strip()
+    if not name:
+        raise gr.Error("Booru name cannot be empty.")
+
+    host = _normalize_host(host)
+
+    booru_index = _find_booru_index(original_name)
+    if booru_index is None:
+        raise gr.Error(f"Booru '{original_name}' was not found.")
+
+    if name != original_name and name in _booru_names():
+        raise gr.Error(f"A booru named '{name}' already exists.")
+
+    booru = settings["boorus"][booru_index]
+    booru["name"] = name
+    booru["host"] = host
+    booru["username"] = username or ""
+    booru["apikey"] = apikey or ""
+
+    settings["active"] = name
     settings["negativeprompt"] = negprompt
 
-    #Stepping through all the boorus in the settings till we find the right one
-    for booru in settings['boorus']:
-        if booru['name'] == active:
-            booru["username"] = username
-            booru["apikey"] = apikey
-    file = open(edirectory + "settings.json", "w")
-    file.write(json.dumps(settings))
-    file.close()
+    _persist_settings()
+
+    return _build_settings_outputs()
+
+def addbooru(name, host, username, apikey, negprompt):
+    name = (name or "").strip()
+    if not name:
+        raise gr.Error("Booru name cannot be empty.")
+
+    host = _normalize_host(host)
+
+    if name in _booru_names():
+        raise gr.Error(f"A booru named '{name}' already exists.")
+
+    settings["boorus"].append({
+        "name": name,
+        "host": host,
+        "username": username or "",
+        "apikey": apikey or "",
+    })
+
+    settings["active"] = name
+    settings["negativeprompt"] = negprompt
+
+    _persist_settings()
+
+    return _build_settings_outputs()
+
+def removebooru(active, negprompt):
+    if len(settings.get("boorus", [])) <= 1:
+        raise gr.Error("At least one booru must remain.")
+
+    booru_index = _find_booru_index(active)
+    if booru_index is None:
+        raise gr.Error(f"Booru '{active}' was not found.")
+
+    removed = settings["boorus"].pop(booru_index)
+
+    settings["negativeprompt"] = negprompt
+
+    if settings["active"] == removed["name"]:
+        _ensure_active()
+    else:
+        _ensure_active(settings["active"])
+
+    _persist_settings()
+
+    return _build_settings_outputs()
 
 #We're loading the settings here since all the further functions depend on this existing already
 settings = loadsettings()
@@ -57,9 +206,11 @@ def getauth():
     Returns:
         tuple: (username, apikey) for whichever booru is selected in the dropdown
     """    
+    active_name = _ensure_active()
     for b in settings['boorus']:
-        if b['name'] == settings['active']:
-            return b['username'], b['apikey']
+        if b['name'] == active_name:
+            return b.get('username', ''), b.get('apikey', '')
+    return "", ""
 
 def gethost():
     """Get the url for the currently selected booru.
@@ -71,9 +222,11 @@ def gethost():
     Returns:
         str: The full url for the selected booru
     """    
+    active_name = _ensure_active()
     for booru in settings['boorus']:
-        if booru['name'] == settings['active']:
-            return booru['host']
+        if booru['name'] == active_name:
+            return booru.get('host', '')
+    return ""
 
 def searchbooru(query, removeanimated, curpage, pagechange=0):
     """Search the currently selected booru, and return a list of images and the current page.
@@ -182,15 +335,24 @@ def updatesettings(active = settings['active']):
         active (str, optional): The str name of the booru the user switched to. Defaults to settings['active'].
 
     Returns:
-        (str, str, str, str): The username, apikey, name, and name again of the selected booru.
-        We're only returning the name twice here since it needs to update two seperate Gradio components.
-    """    
-    settings['active'] = active
-    for booru in settings['boorus']:
-        if booru['name'] == active:
-            username = booru['username']
-            apikey = booru['apikey']
-    return username, apikey, active, active
+        (str, str, str, str, str, str): The username, apikey, current booru label text,
+        duplicate label text, editable booru name, and host URL for the selected booru.
+    """
+    active_name = _ensure_active(active)
+
+    booru = next((b for b in settings['boorus'] if b['name'] == active_name), None)
+
+    if not booru:
+        return "", "", active_name, active_name, "", ""
+
+    return (
+        booru.get('username', ''),
+        booru.get('apikey', ''),
+        active_name,
+        active_name,
+        booru.get('name', ''),
+        booru.get('host', ''),
+    )
 
 def grabtags(url, negprompt, replacespaces, replaceunderscores, includeartist, includecharacter, includecopyright, includemeta):
     """Get the tags for the selected post and update all the relevant textboxes on the Select tab.
@@ -295,7 +457,9 @@ def on_ui_tabs():
     #However, for these ones, I need to reference them before they would've otherwise been
     #initialized, so I put them up here instead. This is totally fine, since they can be 
     #rendered in the appropirate place with .render()
-    boorulist = [booru["name"] for booru in settings["boorus"]]
+    _ensure_active()
+    boorulist = _booru_names()
+    active_booru = next((b for b in settings["boorus"] if b["name"] == settings["active"]), {})
     selectimage = gr.Image(label="Image", type="filepath", interactive=False)
     searchimages = gr.Gallery(label="Search Results", columns=3)
     activeboorutext1 = gr.Textbox(label="Current Booru", value=settings['active'], interactive=False)
@@ -385,14 +549,21 @@ def on_ui_tabs():
         with gr.Tab("Settings/API Keys"):
             settingshelptext = gr.HTML(interactive=False, show_label = False, value="API info may not be necessary for some boorus, but certain information or posts may fail to load without it. For example, Danbooru doesn't show certain posts in search results unless you auth as a Gold tier member.")
             settingshelptext2 = gr.HTML(interactive=False, show_label=False, value="Also, please set the booru selection here before using select or search.")
-            booru = gr.Dropdown(label="Booru",value=settings['active'],choices=boorulist, interactive=True)
+            booru = gr.Dropdown(label="Booru", value=settings['active'], choices=boorulist, interactive=True)
+            booruname = gr.Textbox(label="Booru Name", value=active_booru.get("name", settings.get("active", "")), placeholder="Display name shown in menus")
+            booruhost = gr.Textbox(label="Booru Host URL", value=active_booru.get("host", ""), placeholder="https://example.com")
             u, a = getauth()
             username = gr.Textbox(label="Username", value=u)
             apikey = gr.Textbox(label="API Key", value=a)
             negprompt.render()
-            savesettingsbutton = gr.Button(value="Save Settings", variant="primary")
-            savesettingsbutton.click(fn=savesettings, inputs=[booru, username, apikey, negprompt])
-            booru.change(fn=updatesettings, inputs=booru, outputs=[username, apikey, activeboorutext1, activeboorutext2])
+            with gr.Row():
+                addboorubutton = gr.Button(value="Add as New Booru", variant="secondary")
+                savesettingsbutton = gr.Button(value="Save Booru", variant="primary")
+                removeboorubutton = gr.Button(value="Remove Booru", variant="secondary")
+            savesettingsbutton.click(fn=savesettings, inputs=[booru, booruname, booruhost, username, apikey, negprompt], outputs=[booru, booruname, booruhost, username, apikey, activeboorutext1, activeboorutext2])
+            addboorubutton.click(fn=addbooru, inputs=[booruname, booruhost, username, apikey, negprompt], outputs=[booru, booruname, booruhost, username, apikey, activeboorutext1, activeboorutext2])
+            removeboorubutton.click(fn=removebooru, inputs=[booru, negprompt], outputs=[booru, booruname, booruhost, username, apikey, activeboorutext1, activeboorutext2])
+            booru.change(fn=updatesettings, inputs=booru, outputs=[username, apikey, activeboorutext1, activeboorutext2, booruname, booruhost])
 
     return (interface, "booru2prompt", "b2p_interface"),
 
