@@ -13,7 +13,7 @@ To start, visit the `Settings/API Keys` tab to put in your API keys. Most featur
 The extension now ships with three pre-configured services—Danbooru, Gelbooru, and AIBooru—so you can get going immediately. When you want to connect to a different booru, use the UI controls on that same tab:
 
 1. Pick an existing entry from the **Booru** dropdown to review or edit its credentials.
-2. Adjust the display name, host URL, and optional username or API key fields. Host URLs must be valid `http://` or `https://` addresses; the extension normalises the URL and persists it back to `settings.json` for you.
+2. Adjust the display name, host URL, and optional username or API key fields. Host URLs must be valid `http://` or `https://` addresses; the extension normalizes the URL and persists it back to `settings.json` for you.
 3. Press **Save Booru** to update the selected entry, **Add as New Booru** to clone the form into a brand-new slot, or **Remove Booru** if you no longer need the selection.
 
 Any updates you make are written straight to `settings.json`, so the dropdown refreshes immediately and your choices are available the next time you launch the extension. Credentials remain optional—leave them blank unless the target booru requires authentication for the features you need.
