@@ -200,10 +200,10 @@ def _safe_fetch_json(url, *, description):
 def _query_with_auth(params, username="", apikey="", *, auth_mode="danbooru"):
     params = dict(params)
     if auth_mode in ("danbooru", "e621"):
-        if username:
-            params["login"] = username
         if apikey:
             params["api_key"] = apikey
+        if username:
+            params["login"] = username
     elif auth_mode == "moebooru":
         if username:
             params["login"] = username
