@@ -2,8 +2,9 @@ import base64
 import json
 import os
 import re
+import shutil
 from functools import lru_cache
-from urllib.request import urlopen, urlretrieve, Request
+from urllib.request import urlopen, Request
 from urllib import parse
 from urllib.error import HTTPError, URLError
 import inspect
@@ -51,6 +52,7 @@ def loadsettings():
     for booru in settings["boorus"]:
         booru.setdefault("username", "")
         booru.setdefault("apikey", "")
+        booru.setdefault("cookie", "")
         booru.setdefault("system", "auto")
         if booru["system"] not in SUPPORTED_SYSTEMS:
             booru["system"] = "auto"
@@ -121,6 +123,8 @@ def _build_settings_outputs():
             "",
             "",
             "",
+            "",
+            "",
         )
 
     booru = next((b for b in settings["boorus"] if b["name"] == active_name), None)
@@ -136,6 +140,7 @@ def _build_settings_outputs():
         booru.get("host", ""),
         booru.get("username", ""),
         booru.get("apikey", ""),
+        booru.get("cookie", ""),
         system_display,
         active_name,
         active_name,
@@ -175,6 +180,20 @@ def _build_auth_headers(username="", apikey="", *, auth_mode="danbooru"):
     return {}
 
 
+def _build_request_headers(username="", apikey="", cookie="", *, auth_mode="danbooru"):
+    headers = _build_auth_headers(username, apikey, auth_mode=auth_mode)
+    if headers:
+        headers = dict(headers)
+    else:
+        headers = {}
+
+    cookie = (cookie or "").strip()
+    if cookie:
+        headers["Cookie"] = cookie
+
+    return headers
+
+
 def _fetch_json(url, *, headers=None, raise_for_status=True):
     merged_headers = dict(DEFAULT_HEADERS)
     if headers:
@@ -201,8 +220,9 @@ def _fetch_json(url, *, headers=None, raise_for_status=True):
         if "challenge-container" in text and "X-Verification-Challenge" in text:
             raise gr.Error(
                 "The booru responded with an interactive verification challenge. "
-                "Open the booru in a browser and complete the verification step, "
-                "then retry once normal API responses are restored."
+                "Open the booru in a browser, complete the verification, and paste "
+                "the resulting session cookie into the booru's settings before "
+                "retrying."
             )
         if raise_for_status:
             raise
@@ -275,6 +295,17 @@ def _prepare_local_image_path(index, source_url):
         ext = ".jpg"
     filename = f"temp{index}{ext}"
     return os.path.join(edirectory, "tempimages", filename)
+
+
+def _download_to_path(url, destination, *, headers=None):
+    merged_headers = dict(DEFAULT_HEADERS)
+    if headers:
+        merged_headers.update(headers)
+
+    request = Request(url, data=None, headers=merged_headers)
+    with urlopen(request) as response, open(destination, "wb") as file:
+        shutil.copyfileobj(response, file)
+
 
 def _build_tag_query(query, removeanimated):
     query = (query or "").strip()
@@ -377,16 +408,17 @@ def _normalize_philomena_post(post):
     return _normalize_post_general(general, image_url=image_url, artist=artist, character=character)
 
 @lru_cache(maxsize=None)
-def detect_booru_type(host, username="", apikey=""):
+def detect_booru_type(host, username="", apikey="", cookie=""):
     host = (host or "").rstrip("/")
     username = username or ""
     apikey = apikey or ""
+    cookie = cookie or ""
 
     detectors = [
-        ("Danbooru/e621", lambda: _detect_danbooru(host, username, apikey)),
-        ("Moebooru", lambda: _detect_moebooru(host, username, apikey)),
-        ("Gelbooru", lambda: _detect_gelbooru(host, username, apikey)),
-        ("Philomena", lambda: _detect_philomena(host, username, apikey)),
+        ("Danbooru/e621", lambda: _detect_danbooru(host, username, apikey, cookie)),
+        ("Moebooru", lambda: _detect_moebooru(host, username, apikey, cookie)),
+        ("Gelbooru", lambda: _detect_gelbooru(host, username, apikey, cookie)),
+        ("Philomena", lambda: _detect_philomena(host, username, apikey, cookie)),
     ]
 
     for name, detector in detectors:
@@ -400,10 +432,10 @@ def detect_booru_type(host, username="", apikey=""):
         "Please verify the host URL and credentials, or manually select the booru system type in Settings."
     )
 
-def _detect_danbooru(host, username, apikey):
+def _detect_danbooru(host, username, apikey, cookie):
     params = _query_with_auth({"limit": 1}, username, apikey, auth_mode="danbooru")
     url = f"{host}/posts.json?{parse.urlencode(params)}"
-    headers = _build_auth_headers(username, apikey, auth_mode="danbooru")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="danbooru")
     data = _fetch_json(url, headers=headers, raise_for_status=False)
     if not data:
         return None
@@ -416,15 +448,16 @@ def _detect_danbooru(host, username, apikey):
 
     return None
 
-def _detect_moebooru(host, username, apikey):
+def _detect_moebooru(host, username, apikey, cookie):
     params = _query_with_auth({"limit": 1}, username, apikey, auth_mode="moebooru")
     url = f"{host}/post.json?{parse.urlencode(params)}"
-    data = _fetch_json(url, raise_for_status=False)
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="moebooru")
+    data = _fetch_json(url, headers=headers, raise_for_status=False)
     if isinstance(data, list) and data and isinstance(data[0], dict) and "tags" in data[0]:
         return "moebooru"
     return None
 
-def _detect_gelbooru(host, username, apikey):
+def _detect_gelbooru(host, username, apikey, cookie):
     params = _query_with_auth(
         {
             "page": "dapi",
@@ -438,7 +471,8 @@ def _detect_gelbooru(host, username, apikey):
         auth_mode="gelbooru",
     )
     url = f"{host}/index.php?{parse.urlencode(params)}"
-    data = _fetch_json(url, raise_for_status=False)
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="gelbooru")
+    data = _fetch_json(url, headers=headers, raise_for_status=False)
     if isinstance(data, dict) and "post" in data:
         posts = data["post"]
         if isinstance(posts, dict) or (isinstance(posts, list) and posts):
@@ -447,20 +481,21 @@ def _detect_gelbooru(host, username, apikey):
         return "gelbooru"
     return None
 
-def _detect_philomena(host, username, apikey):
+def _detect_philomena(host, username, apikey, cookie):
     params = _query_with_auth({"q": "id.gt:0", "per_page": 1, "page": 1}, username, apikey, auth_mode="philomena")
     url = f"{host}/api/v1/json/search/images?{parse.urlencode(params)}"
-    data = _fetch_json(url, raise_for_status=False)
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="philomena")
+    data = _fetch_json(url, headers=headers, raise_for_status=False)
     if isinstance(data, dict) and data.get("images") is not None:
         return "philomena"
     return None
 
-def _search_danbooru(host, username, apikey, tags, page, limit):
+def _search_danbooru(host, username, apikey, cookie, tags, page, limit):
     params = _query_with_auth({"limit": limit, "page": page}, username, apikey, auth_mode="danbooru")
     params["tags"] = tags
     url = f"{host}/posts.json?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    headers = _build_auth_headers(username, apikey, auth_mode="danbooru")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="danbooru")
     data = _safe_fetch_json(url, description="search the booru", headers=headers)
     posts = data.get("posts", []) if isinstance(data, dict) else data
     if posts is None:
@@ -479,12 +514,12 @@ def _search_danbooru(host, username, apikey, tags, page, limit):
         results.append({"id": str(post["id"]), "image_url": image_url})
     return results
 
-def _search_e621(host, username, apikey, tags, page, limit):
+def _search_e621(host, username, apikey, cookie, tags, page, limit):
     params = _query_with_auth({"limit": limit, "page": page}, username, apikey, auth_mode="e621")
     params["tags"] = tags
     url = f"{host}/posts.json?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    headers = _build_auth_headers(username, apikey, auth_mode="e621")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="e621")
     data = _safe_fetch_json(url, description="search the booru", headers=headers)
     posts = data.get("posts", []) if isinstance(data, dict) else []
     if not isinstance(posts, list):
@@ -501,11 +536,12 @@ def _search_e621(host, username, apikey, tags, page, limit):
         results.append({"id": str(post["id"]), "image_url": image_url})
     return results
 
-def _search_moebooru(host, username, apikey, tags, page, limit):
+def _search_moebooru(host, username, apikey, cookie, tags, page, limit):
     params = _query_with_auth({"limit": limit, "page": page, "tags": tags}, username, apikey, auth_mode="moebooru")
     url = f"{host}/post.json?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="search the booru")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="moebooru")
+    data = _safe_fetch_json(url, description="search the booru", headers=headers)
     if data is None:
         return []
     if not isinstance(data, list):
@@ -522,7 +558,7 @@ def _search_moebooru(host, username, apikey, tags, page, limit):
         results.append({"id": str(post["id"]), "image_url": image_url})
     return results
 
-def _search_gelbooru(host, username, apikey, tags, page, limit):
+def _search_gelbooru(host, username, apikey, cookie, tags, page, limit):
     pid = max(page - 1, 0)
     params = _query_with_auth(
         {
@@ -540,7 +576,8 @@ def _search_gelbooru(host, username, apikey, tags, page, limit):
     )
     url = f"{host}/index.php?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="search the booru")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="gelbooru")
+    data = _safe_fetch_json(url, description="search the booru", headers=headers)
     if isinstance(data, dict):
         posts = data.get("post", [])
         if isinstance(posts, dict):
@@ -563,13 +600,14 @@ def _search_gelbooru(host, username, apikey, tags, page, limit):
         results.append({"id": str(post["id"]), "image_url": image_url})
     return results
 
-def _search_philomena(host, username, apikey, tags, page, limit):
+def _search_philomena(host, username, apikey, cookie, tags, page, limit):
     tokens = [token for token in (tags or "").split() if token]
     query_value = ",".join(tokens) if tokens else "*"
     params = _query_with_auth({"q": query_value, "per_page": limit, "page": page}, username, apikey, auth_mode="philomena")
     url = f"{host}/api/v1/json/search/images?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="search the booru")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="philomena")
+    data = _safe_fetch_json(url, description="search the booru", headers=headers)
     images = data.get("images", []) if isinstance(data, dict) else []
     if not isinstance(images, list):
         raise gr.Error("Booru returned an unexpected search payload.")
@@ -593,7 +631,7 @@ SEARCH_HANDLERS = {
     "philomena": _search_philomena,
 }
 
-def _fetch_danbooru_post(host, username, apikey, post_id, reference_url):
+def _fetch_danbooru_post(host, username, apikey, cookie, post_id, reference_url):
     params = _query_with_auth({}, username, apikey, auth_mode="danbooru")
     if post_id:
         url = _append_query(f"{host}/posts/{post_id}.json", params)
@@ -606,36 +644,37 @@ def _fetch_danbooru_post(host, username, apikey, post_id, reference_url):
         raise gr.Error("Unable to determine which post to load.")
 
     _sanitize_url_for_logging(url)
-    headers = _build_auth_headers(username, apikey, auth_mode="danbooru")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="danbooru")
     data = _safe_fetch_json(url, description="load post details", headers=headers)
     if isinstance(data, dict):
         return _normalize_danbooru_post(data)
     raise gr.Error("Booru returned an unexpected payload when loading the post.")
 
-def _fetch_e621_post(host, username, apikey, post_id, reference_url):
+def _fetch_e621_post(host, username, apikey, cookie, post_id, reference_url):
     if not post_id:
         raise gr.Error("Unable to determine which post to load.")
     params = _query_with_auth({}, username, apikey, auth_mode="e621")
     url = _append_query(f"{host}/posts/{post_id}.json", params)
     _sanitize_url_for_logging(url)
-    headers = _build_auth_headers(username, apikey, auth_mode="e621")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="e621")
     data = _safe_fetch_json(url, description="load post details", headers=headers)
     if isinstance(data, dict) and isinstance(data.get("post"), dict):
         return _normalize_e621_post(data["post"])
     raise gr.Error("Booru returned an unexpected payload when loading the post.")
 
-def _fetch_moebooru_post(host, username, apikey, post_id, reference_url):
+def _fetch_moebooru_post(host, username, apikey, cookie, post_id, reference_url):
     if not post_id:
         raise gr.Error("Unable to determine which post to load.")
     params = _query_with_auth({"tags": f"id:{post_id}", "limit": 1}, username, apikey, auth_mode="moebooru")
     url = f"{host}/post.json?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="load post details")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="moebooru")
+    data = _safe_fetch_json(url, description="load post details", headers=headers)
     if isinstance(data, list) and data:
         return _normalize_moebooru_post(data[0])
     raise gr.Error("Post could not be found on the selected booru.")
 
-def _fetch_gelbooru_post(host, username, apikey, post_id, reference_url):
+def _fetch_gelbooru_post(host, username, apikey, cookie, post_id, reference_url):
     if not post_id:
         raise gr.Error("Unable to determine which post to load.")
     params = _query_with_auth(
@@ -653,7 +692,8 @@ def _fetch_gelbooru_post(host, username, apikey, post_id, reference_url):
     )
     url = f"{host}/index.php?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="load post details")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="gelbooru")
+    data = _safe_fetch_json(url, description="load post details", headers=headers)
     if isinstance(data, dict) and data.get("post"):
         posts = data["post"]
         if isinstance(posts, dict):
@@ -664,13 +704,14 @@ def _fetch_gelbooru_post(host, username, apikey, post_id, reference_url):
         return _normalize_gelbooru_post(data[0])
     raise gr.Error("Post could not be found on the selected booru.")
 
-def _fetch_philomena_post(host, username, apikey, post_id, reference_url):
+def _fetch_philomena_post(host, username, apikey, cookie, post_id, reference_url):
     if not post_id:
         raise gr.Error("Unable to determine which post to load.")
     params = _query_with_auth({}, username, apikey, auth_mode="philomena")
     url = _append_query(f"{host}/api/v1/json/images/{post_id}", params)
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="load post details")
+    headers = _build_request_headers(username, apikey, cookie, auth_mode="philomena")
+    data = _safe_fetch_json(url, description="load post details", headers=headers)
     if isinstance(data, dict) and isinstance(data.get("image"), dict):
         return _normalize_philomena_post(data["image"])
     raise gr.Error("Post could not be found on the selected booru.")
@@ -683,7 +724,7 @@ POST_FETCHERS = {
     "philomena": _fetch_philomena_post,
 }
 
-def savesettings(active, name, host, username, apikey, system_display, negprompt):
+def savesettings(active, name, host, username, apikey, cookie, system_display, negprompt):
     """Persist updates to the currently selected booru.
 
     Args:
@@ -692,6 +733,7 @@ def savesettings(active, name, host, username, apikey, system_display, negprompt
         host (str): The base URL for the booru
         username (str): The username for that booru
         apikey (str): The user's api key
+        cookie (str): Session cookie string to include in requests
         system_display (str): The booru system to use for requests
         negprompt (str): The negative prompt to be appended to each image selection
     """
@@ -718,6 +760,7 @@ def savesettings(active, name, host, username, apikey, system_display, negprompt
     booru["host"] = host
     booru["username"] = username or ""
     booru["apikey"] = apikey or ""
+    booru["cookie"] = cookie or ""
     booru["system"] = system_value
 
     settings["active"] = name
@@ -727,7 +770,7 @@ def savesettings(active, name, host, username, apikey, system_display, negprompt
 
     return _build_settings_outputs()
 
-def addbooru(name, host, username, apikey, system_display, negprompt):
+def addbooru(name, host, username, apikey, cookie, system_display, negprompt):
     name = (name or "").strip()
     if not name:
         raise gr.Error("Booru name cannot be empty.")
@@ -746,6 +789,7 @@ def addbooru(name, host, username, apikey, system_display, negprompt):
         "host": host,
         "username": username or "",
         "apikey": apikey or "",
+        "cookie": cookie or "",
         "system": system_value,
     })
 
@@ -791,6 +835,15 @@ def getauth():
         return booru.get('username', ''), booru.get('apikey', '')
     return "", ""
 
+
+def getcookie():
+    """Get the session cookie for the currently selected booru."""
+
+    booru = _get_active_booru()
+    if booru:
+        return booru.get('cookie', '')
+    return ""
+
 def gethost():
     """Get the url for the currently selected booru.
     This url will get piped straight into every request, so https:// should be
@@ -830,12 +883,13 @@ def searchbooru(query, removeanimated, curpage, pagechange=0):
     """
     host = gethost()
     u, a = getauth()
+    cookie = getcookie()
     booru = _get_active_booru() or {}
     system_override = (booru.get("system", "auto") or "auto").lower()
     if system_override not in SUPPORTED_SYSTEMS:
         system_override = "auto"
     if system_override == "auto":
-        booru_type = detect_booru_type(host, u, a)
+        booru_type = detect_booru_type(host, u, a, cookie)
     else:
         booru_type = system_override
 
@@ -860,7 +914,7 @@ def searchbooru(query, removeanimated, curpage, pagechange=0):
         raise gr.Error(f"Search is not supported for booru type '{booru_type}'.")
 
     tags = _build_tag_query(query, removeanimated)
-    results = handler(host, u, a, tags, int(curpage), 6)
+    results = handler(host, u, a, cookie, tags, int(curpage), 6)
 
     temp_dir = os.path.join(edirectory, "tempimages")
     os.makedirs(temp_dir, exist_ok=True)
@@ -872,8 +926,9 @@ def searchbooru(query, removeanimated, curpage, pagechange=0):
             continue
 
         savepath = _prepare_local_image_path(index, image_url)
+        request_headers = _build_request_headers(u, a, cookie, auth_mode=booru_type)
         try:
-            urlretrieve(image_url, savepath)
+            _download_to_path(image_url, savepath, headers=request_headers)
         except Exception as error:
             print(f"Failed to cache preview {image_url}: {error}")
             continue
@@ -905,13 +960,14 @@ def updatesettings(active = settings['active']):
 
     if not booru:
         system_display = SYSTEM_DISPLAY_NAMES["auto"]
-        return "", "", active_name, active_name, "", "", system_display
+        return "", "", "", active_name, active_name, "", "", system_display
 
     system_display = SYSTEM_DISPLAY_NAMES.get(booru.get('system', 'auto'), SYSTEM_DISPLAY_NAMES['auto'])
 
     return (
         booru.get('username', ''),
         booru.get('apikey', ''),
+        booru.get('cookie', ''),
         active_name,
         active_name,
         booru.get('name', ''),
@@ -942,12 +998,13 @@ def grabtags(url, negprompt, replacespaces, replaceunderscores, includeartist, i
 
     host = gethost()
     username, apikey = getauth()
+    cookie = getcookie()
     booru = _get_active_booru() or {}
     system_override = (booru.get("system", "auto") or "auto").lower()
     if system_override not in SUPPORTED_SYSTEMS:
         system_override = "auto"
     if system_override == "auto":
-        booru_type = detect_booru_type(host, username, apikey)
+        booru_type = detect_booru_type(host, username, apikey, cookie)
     else:
         booru_type = system_override
 
@@ -956,7 +1013,7 @@ def grabtags(url, negprompt, replacespaces, replaceunderscores, includeartist, i
     if fetcher is None:
         raise gr.Error(f"Loading posts is not supported for booru type '{booru_type}'.")
 
-    normalized = fetcher(host, username, apikey, post_id, reference_url)
+    normalized = fetcher(host, username, apikey, cookie, post_id, reference_url)
 
     image_url = _absolute_url(host, normalized.get("image_url"))
     if not image_url:
@@ -993,7 +1050,8 @@ def grabtags(url, negprompt, replacespaces, replaceunderscores, includeartist, i
     temp_dir = os.path.join(edirectory, "tempimages")
     os.makedirs(temp_dir, exist_ok=True)
     savepath = os.path.join(temp_dir, "temp.jpg")
-    urlretrieve(image_url, savepath)
+    headers = _build_request_headers(username, apikey, cookie, auth_mode=booru_type)
+    _download_to_path(image_url, savepath, headers=headers)
 
     return (tags, savepath, artisttags, charactertags, copyrighttags, metatags)
 
@@ -1095,23 +1153,24 @@ def on_ui_tabs():
                         sendsearched.click(fn = None, _js="switch_to_select", outputs = imagelink)
         with gr.Tab("Settings/API Keys"):
             settingshelptext = gr.HTML(interactive=False, show_label = False, value="API info may not be necessary for some boorus, but certain information or posts may fail to load without it. For example, Danbooru doesn't show certain posts in search results unless you auth as a Gold tier member.")
-            settingshelptext2 = gr.HTML(interactive=False, show_label=False, value="Also, please set the booru selection here before using select or search.")
+            settingshelptext2 = gr.HTML(interactive=False, show_label=False, value="Also, please set the booru selection here before using select or search. If the booru presents a browser challenge, paste the validated session cookie below.")
             booru = gr.Dropdown(label="Booru", value=settings['active'], choices=boorulist, interactive=True)
             booruname = gr.Textbox(label="Booru Name", value=active_booru.get("name", settings.get("active", "")), placeholder="Display name shown in menus")
             booruhost = gr.Textbox(label="Booru Host URL", value=active_booru.get("host", ""), placeholder="https://example.com")
             u, a = getauth()
             username = gr.Textbox(label="Username", value=u)
             apikey = gr.Textbox(label="API Key", value=a)
+            cookie = gr.Textbox(label="Session Cookie", value=active_booru.get("cookie", ""), placeholder="Optional raw Cookie header value", lines=2)
             boorutype = gr.Dropdown(label="Booru System", choices=list(SYSTEM_DISPLAY_NAMES.values()), value=active_system_display)
             negprompt.render()
             with gr.Row():
                 addboorubutton = gr.Button(value="Add as New Booru", variant="secondary")
                 savesettingsbutton = gr.Button(value="Save Booru", variant="primary")
                 removeboorubutton = gr.Button(value="Remove Booru", variant="secondary")
-            savesettingsbutton.click(fn=savesettings, inputs=[booru, booruname, booruhost, username, apikey, boorutype, negprompt], outputs=[booru, booruname, booruhost, username, apikey, boorutype, activeboorutext1, activeboorutext2])
-            addboorubutton.click(fn=addbooru, inputs=[booruname, booruhost, username, apikey, boorutype, negprompt], outputs=[booru, booruname, booruhost, username, apikey, boorutype, activeboorutext1, activeboorutext2])
-            removeboorubutton.click(fn=removebooru, inputs=[booru, negprompt], outputs=[booru, booruname, booruhost, username, apikey, boorutype, activeboorutext1, activeboorutext2])
-            booru.change(fn=updatesettings, inputs=booru, outputs=[username, apikey, activeboorutext1, activeboorutext2, booruname, booruhost, boorutype])
+            savesettingsbutton.click(fn=savesettings, inputs=[booru, booruname, booruhost, username, apikey, cookie, boorutype, negprompt], outputs=[booru, booruname, booruhost, username, apikey, cookie, boorutype, activeboorutext1, activeboorutext2])
+            addboorubutton.click(fn=addbooru, inputs=[booruname, booruhost, username, apikey, cookie, boorutype, negprompt], outputs=[booru, booruname, booruhost, username, apikey, cookie, boorutype, activeboorutext1, activeboorutext2])
+            removeboorubutton.click(fn=removebooru, inputs=[booru, negprompt], outputs=[booru, booruname, booruhost, username, apikey, cookie, boorutype, activeboorutext1, activeboorutext2])
+            booru.change(fn=updatesettings, inputs=booru, outputs=[username, apikey, cookie, activeboorutext1, activeboorutext2, booruname, booruhost, boorutype])
 
     return (interface, "booru2prompt", "b2p_interface"),
 
