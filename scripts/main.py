@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import re
@@ -159,8 +160,26 @@ def _append_query(url, params):
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}{parse.urlencode(params)}"
 
-def _fetch_json(url, *, raise_for_status=True):
-    request = Request(url, data=None, headers=DEFAULT_HEADERS)
+def _build_auth_headers(username="", apikey="", *, auth_mode="danbooru"):
+    username = (username or "").strip()
+    apikey = (apikey or "").strip()
+
+    if not username or not apikey:
+        return {}
+
+    if auth_mode in ("danbooru", "e621"):
+        token = f"{username}:{apikey}".encode("utf-8")
+        encoded = base64.b64encode(token).decode("ascii")
+        return {"Authorization": f"Basic {encoded}"}
+
+    return {}
+
+
+def _fetch_json(url, *, headers=None, raise_for_status=True):
+    merged_headers = dict(DEFAULT_HEADERS)
+    if headers:
+        merged_headers.update(headers)
+    request = Request(url, data=None, headers=merged_headers)
     try:
         with urlopen(request) as response:
             payload = response.read()
@@ -179,13 +198,20 @@ def _fetch_json(url, *, raise_for_status=True):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        if "challenge-container" in text and "X-Verification-Challenge" in text:
+            raise gr.Error(
+                "The booru responded with an interactive verification challenge. "
+                "Open the booru in a browser and complete the verification step, "
+                "then retry once normal API responses are restored."
+            )
         if raise_for_status:
             raise
         return None
 
-def _safe_fetch_json(url, *, description):
+
+def _safe_fetch_json(url, *, description, headers=None):
     try:
-        return _fetch_json(url)
+        return _fetch_json(url, headers=headers)
     except HTTPError as error:
         raise gr.Error(f"Failed to {description}: HTTP {error.code}. The booru may require authentication or the endpoint may not exist.") from error
     except URLError as error:
@@ -377,7 +403,8 @@ def detect_booru_type(host, username="", apikey=""):
 def _detect_danbooru(host, username, apikey):
     params = _query_with_auth({"limit": 1}, username, apikey, auth_mode="danbooru")
     url = f"{host}/posts.json?{parse.urlencode(params)}"
-    data = _fetch_json(url, raise_for_status=False)
+    headers = _build_auth_headers(username, apikey, auth_mode="danbooru")
+    data = _fetch_json(url, headers=headers, raise_for_status=False)
     if not data:
         return None
 
@@ -433,7 +460,8 @@ def _search_danbooru(host, username, apikey, tags, page, limit):
     params["tags"] = tags
     url = f"{host}/posts.json?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="search the booru")
+    headers = _build_auth_headers(username, apikey, auth_mode="danbooru")
+    data = _safe_fetch_json(url, description="search the booru", headers=headers)
     posts = data.get("posts", []) if isinstance(data, dict) else data
     if posts is None:
         posts = []
@@ -456,7 +484,8 @@ def _search_e621(host, username, apikey, tags, page, limit):
     params["tags"] = tags
     url = f"{host}/posts.json?{parse.urlencode(params)}"
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="search the booru")
+    headers = _build_auth_headers(username, apikey, auth_mode="e621")
+    data = _safe_fetch_json(url, description="search the booru", headers=headers)
     posts = data.get("posts", []) if isinstance(data, dict) else []
     if not isinstance(posts, list):
         raise gr.Error("Booru returned an unexpected search payload.")
@@ -577,7 +606,8 @@ def _fetch_danbooru_post(host, username, apikey, post_id, reference_url):
         raise gr.Error("Unable to determine which post to load.")
 
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="load post details")
+    headers = _build_auth_headers(username, apikey, auth_mode="danbooru")
+    data = _safe_fetch_json(url, description="load post details", headers=headers)
     if isinstance(data, dict):
         return _normalize_danbooru_post(data)
     raise gr.Error("Booru returned an unexpected payload when loading the post.")
@@ -588,7 +618,8 @@ def _fetch_e621_post(host, username, apikey, post_id, reference_url):
     params = _query_with_auth({}, username, apikey, auth_mode="e621")
     url = _append_query(f"{host}/posts/{post_id}.json", params)
     _sanitize_url_for_logging(url)
-    data = _safe_fetch_json(url, description="load post details")
+    headers = _build_auth_headers(username, apikey, auth_mode="e621")
+    data = _safe_fetch_json(url, description="load post details", headers=headers)
     if isinstance(data, dict) and isinstance(data.get("post"), dict):
         return _normalize_e621_post(data["post"])
     raise gr.Error("Booru returned an unexpected payload when loading the post.")
